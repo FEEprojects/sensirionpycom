@@ -7,16 +7,18 @@
 
 import logging
 import struct
-from datetime import datetime, timedelta
-from time import sleep
-from serial import Serial, SerialException
+import time
+from machine import Timer, UART
 
-from .sensirion_error_codes import ERROR_CODE_NO_ERROR, lookup_error_code
+from sensirion_error_codes import ERROR_CODE_NO_ERROR, lookup_error_code
 
-DEFAULT_SERIAL_PORT = "/dev/ttyUSB0" # Serial port to use if no other specified
+timestamp_template = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}"  # yyyy-mm-dd hh-mm-ss
+
+DEFAULT_SERIAL_PINS = ('P3', 'P17') # Serial port to use if no other specified
 DEFAULT_BAUD_RATE = 115200 # Serial baud rate to use if no other specified
 DEFAULT_SERIAL_TIMEOUT = 2 # Serial timeout to use if not specified
 DEFAULT_READ_TIMEOUT = 1 #How long to sit looking for the correct character sequence.
+DEFAULT_ID = 1  # UART bus id
 
 DEFAULT_LOGGING_LEVEL = logging.WARN
 DEFAULT_RETRY_COUNT = 3
@@ -58,7 +60,7 @@ class SensirionReading(object):
         """
         if len(line) < 46:
             raise SensirionException("Data too short to parse")
-        self.timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        self.timestamp = timestamp_template.format(*time.gmtime())
         self.pm1 = round(struct.unpack('>f', line[5:9])[0], 1)
         self.pm25 = round(struct.unpack('>f', line[9:13])[0], 1)
         self.pm4 = round(struct.unpack('>f', line[13:17])[0], 1)
@@ -89,20 +91,23 @@ class Sensirion(object):
         Actual interface to the Sensirion SPS030 sensor
     """
     def __init__(
-            self, port=DEFAULT_SERIAL_PORT, baud=DEFAULT_BAUD_RATE,
+            self, pins=DEFAULT_SERIAL_PINS, baud=DEFAULT_BAUD_RATE,
             serial_timeout=DEFAULT_SERIAL_TIMEOUT,
             read_timeout=DEFAULT_READ_TIMEOUT,
             log_level=DEFAULT_LOGGING_LEVEL,
+            id=DEFAULT_ID,
             auto_start=True, retries=DEFAULT_RETRY_COUNT):
         """
             Setup the interface for the sensor
         """
+
         self.logger = logging.getLogger("SPS030 Interface")
         logging.basicConfig(
             format='%(asctime)s - %(name)s - %(lineno)d - %(levelname)s - %(message)s')
         self.logger.setLevel(log_level)
-        self.port = port
-        self.logger.info("Serial port: %s", self.port)
+        self.id = id
+        self.pins = pins
+        self.logger.info("Serial pins: %s", self.pins)
         self.baud = baud
         self.logger.info("Baud rate: %s", self.baud)
         self.serial_timeout = serial_timeout
@@ -112,13 +117,15 @@ class Sensirion(object):
         self.retries = retries
         self.logger.info("Retries: %d", self.retries)
         self.measurement_running = False
-        self.last_measurement = None
+        self.timer = Timer.Chrono()
         try:
-            self.serial = Serial(
-                port=self.port, baudrate=self.baud,
-                timeout=self.serial_timeout)
+            self.serial = UART(
+                self.id,
+                baudrate=self.baud,
+                pins=self.pins,
+                timeout_chars=self.serial_timeout)
             self.logger.debug("Port Opened Successfully")
-        except SerialException as exp:
+        except Exception as exp:
             self.logger.error(str(exp))
             raise SensirionException(str(exp))
         self.reset()
@@ -153,20 +160,19 @@ class Sensirion(object):
         self._tx(
             CMD_ADDR, CMD_START_MEASUREMENT,
             SUBCMD_START_MEASUREMENT_1 + SUBCMD_START_MEASUREMENT_2)
-        sleep(RX_DELAY_S)
+        time.sleep(RX_DELAY_S)
         self._rx(
-            CMD_ADDR, CMD_START_MEASUREMENT,
-            SUBCMD_START_MEASUREMENT_1 + SUBCMD_START_MEASUREMENT_2)
+            CMD_ADDR, CMD_START_MEASUREMENT)
         self.measurement_running = True
-        self.last_measurement = datetime.utcnow()
-
+        self.timer.reset()
+        self.timer.start()
 
     def stop_measurement(self):
         """
             Send the command to stop the sensor reading data
         """
         self._tx(CMD_ADDR, CMD_STOP_MEASUREMENT)
-        sleep(RX_DELAY_S)
+        time.sleep(RX_DELAY_S)
         self._rx(CMD_ADDR, CMD_STOP_MEASUREMENT)
         self.measurement_running = False
 
@@ -175,7 +181,7 @@ class Sensirion(object):
             Send the reset command to the device
         """
         self._tx(CMD_ADDR, CMD_RESET)
-        sleep(RX_DELAY_S)
+        time.sleep(RX_DELAY_S)
         self._rx(CMD_ADDR, CMD_RESET)
         self.measurement_running = False
 
@@ -184,63 +190,61 @@ class Sensirion(object):
             Start a manual clean of the fan, takes 10s
         """
         self._tx(CMD_ADDR, CMD_START_FAN_CLEANING)
-        sleep(RX_DELAY_S)
+        time.sleep(RX_DELAY_S)
         self._rx(CMD_ADDR, CMD_START_FAN_CLEANING)
 
-    def _rx(self, addr, cmd, perform_flush=True):
+    def _rx(self, addr, cmd):
         """
             Recieve and process a message from the sensor
         """
         recv = b''
-        start = datetime.utcnow() #Start timer
-        if perform_flush:
-            self.serial.flush() #Flush any data in the buffer
-        while(
-                datetime.utcnow() <
-                (start + timedelta(seconds=self.read_timeout))):
-            inp = self.serial.read() # Read a character from the input
+        chrono = Timer.Chrono()
+        chrono.reset()  # Reset the timer
+        chrono.start()  # Start timer
+        while chrono.read() < self.read_timeout:
+            inp = self.serial.read(1) # Read a character from the input
             if inp == MSG_START_STOP: # check it matches
                 recv += inp # if it does add it to recieve string
                 self.logger.debug(
-                    "Message : 0x%02x --------", int.from_bytes(recv, byteorder="big"))
-                inp = self.serial.read() # read the next character
+                    "Message : 0x%02x --------", int.from_bytes(recv, "big"))
+                inp = self.serial.read(1) # read the next character
                 self.logger.debug("Addr byte 0x%02x", ord(inp))
                 if inp == addr:
                     recv += inp
                     self.logger.debug(
-                        "Message : 0x%02x --------", int.from_bytes(recv, byteorder="big"))
-                    inp = self.serial.read()
+                        "Message : 0x%02x --------", int.from_bytes(recv, "big"))
+                    inp = self.serial.read(1)
                     self.logger.debug("Cmd byte : 0x%02x --------", ord(inp))
                     if inp == cmd:
                         recv += inp
                         self.logger.debug(
-                            "Message : 0x%02x --------", int.from_bytes(recv, byteorder="big"))
-                        inp = self.serial.read()
+                            "Message : 0x%02x --------", int.from_bytes(recv, "big"))
+                        inp = self.serial.read(1)
                         self.logger.debug("Error state byte : 0x%02x --------", ord(inp))
                         if inp != ERROR_CODE_NO_ERROR:
                             self.logger.error("State error : 0x%02x --------", ord(inp))
                             error_str = lookup_error_code(inp)
                             self.logger.error(error_str)
                             while inp != MSG_START_STOP: #empty the cache of the sensor
-                                inp = self.serial.read()
+                                inp = self.serial.read(1)
                             raise SensirionException(error_str)
                         else:
                             recv += inp
                             self.logger.debug(
                                 "Message : 0x%02x --------",
-                                int.from_bytes(recv, byteorder="big"))
-                            inp = self.serial.read()
+                                int.from_bytes(recv, "big"))
+                            inp = self.serial.read(1)
                             while inp != MSG_START_STOP: #read remaining data until the end byte
                                 recv += inp
                                 self.logger.debug(
                                     "Message : 0x%02x --------",
-                                    int.from_bytes(recv, byteorder="big"))
-                                inp = self.serial.read()
+                                    int.from_bytes(recv, "big"))
+                                inp = self.serial.read(1)
                                 self.logger.debug("Bytes : 0x%02x --------", ord(inp))
                             recv += inp
                             self.logger.debug(
                                 "Message received : 0x%02x --------",
-                                int.from_bytes(recv, byteorder="big"))
+                                int.from_bytes(recv, "big"))
 
                             return recv
                     else:
@@ -248,7 +252,7 @@ class Sensirion(object):
                             "Wrong command received 0x%02x, was expecting 0x%02x",
                             ord(inp), ord(cmd))
                         self.logger.debug(
-                            "Message received 0x%02x", int.from_bytes(recv, byteorder="big"))
+                            "Message received 0x%02x", int.from_bytes(recv, "big"))
                         raise SensirionException("Wrong command")
                 else:
                     self.logger.error(
@@ -256,11 +260,10 @@ class Sensirion(object):
                         ord(inp), ord(addr))
                     self.logger.debug(
                         "Message received 0x%02x",
-                        int.from_bytes(recv, byteorder="big"))
+                        int.from_bytes(recv, "big"))
                     raise SensirionException("Wrong address")
 
         raise SensirionException("Message incomplete")
-
 
     def get_product_name(self):
         """
@@ -288,7 +291,7 @@ class Sensirion(object):
             Get information from the device
         """
         self._tx(CMD_ADDR, CMD_DEVICE_INFORMATION, subcmd)
-        sleep(RX_DELAY_S)
+        time.sleep(RX_DELAY_S)
         return self._rx(CMD_ADDR, CMD_DEVICE_INFORMATION, subcmd)[5:-2]
 
     def _check_length(self, data):
@@ -317,26 +320,27 @@ class Sensirion(object):
         if not self.measurement_running:
             self.logger.warning("Measurement not running, starting measurement")
             self.start_measurement()
-            sleep(RETRY_SLEEP)
-        time_diff = datetime.utcnow() - self.last_measurement
-        if time_diff.total_seconds() < MIN_SAMPLE_INTERVAL:
+            time.sleep(RETRY_SLEEP)
+        time_diff = self.timer.read()
+        if time_diff < MIN_SAMPLE_INTERVAL:
             self.logger.warning("Trying to read too frequently - forcing delay")
-            sleep(MIN_SAMPLE_INTERVAL - time_diff.total_seconds())
+            time.sleep(MIN_SAMPLE_INTERVAL - time_diff)
             self.logger.debug("Sleep complete, now reading")
         count = 1
         while count <= self.retries:
             try:
                 self._tx(CMD_ADDR, CMD_READ_MEASUREMENT)
-                sleep(RX_DELAY_S)
+                time.sleep(RX_DELAY_S)
                 recv = self._rx(CMD_ADDR, CMD_READ_MEASUREMENT)
                 recv_unstuffed = self._unstuff_bytes(recv)
                 self._check_length(recv_unstuffed)
                 self._verify(recv_unstuffed) # verify the checksum
                 self.logger.debug(
                     "Verified message : 0x%02x --------",
-                    int.from_bytes(recv_unstuffed, byteorder="big"))
+                    int.from_bytes(recv_unstuffed, "big"))
                 self.logger.debug(type(recv_unstuffed))
-                self.last_measurement = datetime.utcnow()
+                self.timer.reset()
+                self.timer.start()
                 return SensirionReading(recv_unstuffed)
             except SensirionException as exp:
                 self.logger.warning("Attempt %d/%d failed", count, self.retries)
@@ -344,16 +348,16 @@ class Sensirion(object):
                 if count == self.retries:
                     raise exp
                 count += 1 # increment counter
-                sleep(RETRY_SLEEP)
+                time.sleep(RETRY_SLEEP)
 
     def read_cleaning_interval(self):
         """
             Read the cleaning interval from the sensor
         """
         self._tx(CMD_ADDR, CMD_READ_WRITE_AUTOCLEAN_INTERVAL, SUBCMD_READ_INTERVAL)
-        sleep(RX_DELAY_S)
+        time.sleep(RX_DELAY_S)
         return int.from_bytes(
-            self._rx(CMD_ADDR, CMD_READ_WRITE_AUTOCLEAN_INTERVAL)[5:-2], byteorder='big')
+            self._rx(CMD_ADDR, CMD_READ_WRITE_AUTOCLEAN_INTERVAL)[5:-2], 'big')
 
     def write_cleaning_interval(self, interval):
         """
@@ -370,7 +374,7 @@ class Sensirion(object):
             CMD_ADDR,
             CMD_READ_WRITE_AUTOCLEAN_INTERVAL,
             SUBCMD_READ_INTERVAL + interval_bytes)
-        sleep(RX_DELAY_S)
+        time.sleep(RX_DELAY_S)
         self._rx(
             CMD_ADDR,
             CMD_READ_WRITE_AUTOCLEAN_INTERVAL,
@@ -393,7 +397,7 @@ class Sensirion(object):
         message += self._stuff_bytes(data)
         message += self._stuff_bytes(checksum)
         message += MSG_START_STOP
-        self.logger.debug("Message sent: 0x%02x --------", int.from_bytes(message, byteorder="big"))
+        self.logger.debug("Message sent: 0x%02x --------", int.from_bytes(message, "big"))
         return self.serial.write(message)
 
     def _stuff_bytes(self, data):
@@ -450,7 +454,7 @@ class Sensirion(object):
                 i += 1
         self.logger.debug(
             "Message unstuffed: 0x%02x --------",
-            int.from_bytes(data_unstuffed, byteorder="big"))
+            int.from_bytes(data_unstuffed, "big"))
         return data_unstuffed
 
 

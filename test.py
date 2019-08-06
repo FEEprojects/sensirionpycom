@@ -1,16 +1,13 @@
 import sensirion_sps030
 from time import sleep
 
+RX_DELAY_S = 1
+LOOP_DELAY_S = 1  # cannot poll new reading within one second
 
-RX_DELAY_S = 0.02 
+SPS030 = sensirion_sps030.Sensirion()  # automatically starts measurement
+sleep(RX_DELAY_S)  # wait for sensor to initialize
 
-SPS030 = sensirion_sps030.Sensirion(
-	port="/dev/ttyUSB_SPS030-60762402-3", log_level="DEBUG")
-
-SPS030._start_measurement()
-SPS030._tx(b'\x00', b'\x03')
-sleep(RX_DELAY_S)
-mess=SPS030.serial.read(30)
-
-print(mess)
-
+while True:  # start reading measurements
+    data = SPS030.read()
+    print(data)
+    sleep(LOOP_DELAY_S)
