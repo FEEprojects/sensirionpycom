@@ -5,10 +5,10 @@
     based on https://github.com/FEEprojects/plantower
 """
 
-import logging
+from sensirionpycom import logging
+from machine import Timer, UART
 import struct
 import time
-from machine import Timer, UART
 
 from sensirion_error_codes import ERROR_CODE_NO_ERROR, lookup_error_code
 
